@@ -116,7 +116,7 @@ transfer_session_t *create_session(multi_receiver_state_t *state, uint32_t sende
 
     pthread_mutex_unlock(&state->sessions_mutex);
 
-    printf("🆕 Nueva sesión creada para Sender ID: %u\n", sender_id);
+    printf("Nueva sesión creada para Sender ID: %u\n", sender_id);
     return session;
 }
 
@@ -152,7 +152,7 @@ void cleanup_session(multi_receiver_state_t *state, uint32_t sender_id)
             }
             pthread_mutex_destroy(&current->session_mutex);
 
-            printf("🗑️ Sesión limpiada para Sender ID: %u\n", sender_id);
+            printf("Sesión limpiada para Sender ID: %u\n", sender_id);
             free(current);
             break;
         }
@@ -182,13 +182,13 @@ void create_unique_filename(const char *original_filename, uint32_t sender_id,
         strncpy(base_name, original_filename, base_len);
         base_name[base_len] = '\0';
 
-        // Crear nombre único: base_recibido_SENDERID.extension
-        snprintf(new_filename, max_size, "%s_recibido_%u%s", base_name, sender_id, dot);
+        // Crear nombre único: base_recibido_.extension
+        snprintf(new_filename, max_size, "%s_recibido_%s", base_name, dot);
     }
     else
     {
         // No hay extensión
-        snprintf(new_filename, max_size, "%s_recibido_%u", original_filename, sender_id);
+        snprintf(new_filename, max_size, "%s_recibido_", original_filename);
     }
 }
 
@@ -200,7 +200,7 @@ int handle_multi_start(multi_receiver_state_t *state, const packet_t *pkt,
 
     if (session)
     {
-        printf("⚠️ Reiniciando transferencia existente para Sender ID: %u\n", pkt->sender_id);
+        printf("Reiniciando transferencia existente para Sender ID: %u\n", pkt->sender_id);
         cleanup_session(state, pkt->sender_id);
     }
 
@@ -208,7 +208,7 @@ int handle_multi_start(multi_receiver_state_t *state, const packet_t *pkt,
     session = create_session(state, pkt->sender_id, from_addr);
     if (!session)
     {
-        printf("❌ Error creando sesión para Sender ID: %u\n", pkt->sender_id);
+        printf("Error creando sesión para Sender ID: %u\n", pkt->sender_id);
         return -1;
     }
 
@@ -234,7 +234,7 @@ int handle_multi_start(multi_receiver_state_t *state, const packet_t *pkt,
     session->file = fopen(session->filename, "wb");
     if (!session->file)
     {
-        printf("❌ Error creando archivo: %s\n", session->filename);
+        printf("Error creando archivo: %s\n", session->filename);
         pthread_mutex_unlock(&session->session_mutex);
         cleanup_session(state, pkt->sender_id);
         return -1;
@@ -242,10 +242,10 @@ int handle_multi_start(multi_receiver_state_t *state, const packet_t *pkt,
 
     session->last_activity = time(NULL);
 
-    printf("✅ Transferencia iniciada:\n");
-    printf("   📁 Archivo: %s\n", session->filename);
-    printf("   📦 Paquetes: %u\n", session->total_packets);
-    printf("   🆔 Sender ID: %u\n", session->sender_id);
+    printf("Transferencia iniciada:\n");
+    printf("   Archivo: %s\n", session->filename);
+    printf("   Paquetes: %u\n", session->total_packets);
+    printf("   Sender ID: %u\n", session->sender_id);
 
     pthread_mutex_unlock(&session->session_mutex);
 
@@ -275,7 +275,7 @@ void *packet_worker(void *arg)
 
         if (dequeue_packet(&packet_queue, &pkt, &from_addr) == 0)
         {
-            printf("🔄 Procesando paquete tipo=%d, sender_id=%u, seq=%u\n",
+            printf("Procesando paquete tipo=%d, sender_id=%u, seq=%u\n",
                    pkt.type, pkt.sender_id, pkt.seq_num);
 
             switch (pkt.type)
@@ -302,7 +302,7 @@ void *packet_worker(void *arg)
                         fwrite(pkt.data, 1, pkt.data_size, session->file);
                         fflush(session->file);
 
-                        printf("📦 Paquete %u/%u recibido para %s\n",
+                        printf("Paquete %u/%u recibido para %s\n",
                                pkt.seq_num, session->total_packets, session->filename);
                     }
 
@@ -329,7 +329,7 @@ void *packet_worker(void *arg)
                 transfer_session_t *session = find_session(state, pkt.sender_id);
                 if (session)
                 {
-                    printf("🏁 Transferencia completada para %s\n", session->filename);
+                    printf("Transferencia completada para %s\n", session->filename);
                     cleanup_session(state, pkt.sender_id);
                 }
                 break;
@@ -351,9 +351,9 @@ int main(int argc, char *argv[])
 
     int port = atoi(argv[1]);
 
-    printf("🚀 RECEPTOR MULTI-EMISOR INICIADO 🚀\n");
+    printf("RECEPTOR MULTI-EMISOR INICIADO\n");
     printf("Puerto: %d\n", port);
-    printf("Soporte para emisores concurrentes: ✅\n");
+    printf("Soporte para emisores concurrentes: ACTIVADO\n");
     printf("====================================\n\n");
 
     // Inicializar estado
