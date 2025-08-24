@@ -6,6 +6,7 @@ static volatile int running = 1;
 
 void signal_handler(int sig)
 {
+    (void)sig; 
     printf("\nInterrumpido por usuario, limpiando...\n");
     running = 0;
     sender_cleanup(&global_state);
@@ -14,7 +15,8 @@ void signal_handler(int sig)
 
 void *timeout_handler(void *arg)
 {
-    sender_state_t *state = (sender_state_t *)arg;
+
+    (void)arg; 
 
     // En emisor.c, loop principal mejorado
     while (running && global_state.base_seq <= global_state.total_packets)

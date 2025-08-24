@@ -20,4 +20,4 @@ protocolo.o: protocolo.c protocolo.h
 
 .PHONY: clean
 clean:
-	rm -f emisor receptor *.o received_file
+	rm -f emisor receptor *.o *.txt

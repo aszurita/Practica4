@@ -16,7 +16,9 @@ uint32_t calculate_checksum(const packet_t *pkt)
         checksum += (uint32_t)pkt->data[i];
     }
 
-    for (int i = 0; i < strlen(pkt->filename); i++)
+    // Cambiar esta parte:
+    size_t filename_len = strlen(pkt->filename);
+    for (size_t i = 0; i < filename_len; i++)
     {
         checksum += (uint32_t)pkt->filename[i];
     }
@@ -245,7 +247,7 @@ int sender_send_window(sender_state_t *state)
             char buffer[MAX_DATA_SIZE];
             size_t bytes_read = fread(buffer, 1, MAX_DATA_SIZE, state->file);
 
-            if (bytes_read >= 0) // Permitir paquetes vacíos para archivos pequeños
+            if (feof(state->file) || bytes_read > 0) // Permitir paquetes vacíos para archivos pequeños
             {
                 create_packet(&slot->packet, PKT_DATA, state->next_seq, buffer, bytes_read);
                 slot->packet.sender_id = state->sender_id;
@@ -505,8 +507,8 @@ int receiver_handle_data(receiver_state_t *state, const packet_t *pkt)
     fwrite(pkt->data, 1, pkt->data_size, state->file);
     fflush(state->file);
 
-    printf("Paquete %u/%u recibido (%zu bytes)\n",
-           pkt->seq_num, state->total_packets, pkt->data_size);
+    printf("Paquete %u/%u recibido (%u bytes)\n",
+        pkt->seq_num, state->total_packets, (unsigned int)pkt->data_size);
 
     // Enviar ACK individual (no acumulativo)
     receiver_send_ack(state, pkt->seq_num);

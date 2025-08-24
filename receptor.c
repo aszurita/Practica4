@@ -167,6 +167,8 @@ void cleanup_session(multi_receiver_state_t *state, uint32_t sender_id)
 void create_unique_filename(const char *original_filename, uint32_t sender_id,
                             char *new_filename, size_t max_size)
 {
+    (void)sender_id; // Suprimir warning - parámetro reservado para uso futuro
+
     const char *dot = strrchr(original_filename, '.');
     const char *slash = strrchr(original_filename, '/');
 
@@ -334,6 +336,13 @@ void *packet_worker(void *arg)
                 }
                 break;
             }
+            case PKT_ACK:
+                printf("ACK inesperado recibido (tipo no manejado por receptor)\n");
+                break;
+
+            case PKT_NACK:
+                printf("NACK inesperado recibido (tipo no manejado por receptor)\n");
+                break;
             }
         }
     }
