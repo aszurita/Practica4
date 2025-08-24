@@ -1,341 +1,416 @@
+// receptor_multisender.c
 #include "protocolo.h"
 #include <signal.h>
+#include <semaphore.h>
 
-static receiver_state_t global_state;
-static volatile int running = 1;
+static multi_receiver_state_t global_state;
+static packet_queue_t packet_queue;
+static sem_t queue_sem;
 
-void signal_handler(int sig)
+// Inicializar cola de paquetes
+void init_packet_queue(packet_queue_t *queue)
 {
-    printf("\nInterrumpido por usuario, limpiando...\n");
-    running = 0;
-    receiver_cleanup(&global_state);
-    exit(0);
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->size = 0;
+    pthread_mutex_init(&queue->mutex, NULL);
+    pthread_cond_init(&queue->cond, NULL);
+    sem_init(&queue_sem, 0, 0); // Semáforo para contar paquetes
 }
 
-void print_usage(const char *program_name)
+// Agregar paquete a la cola (thread-safe)
+void enqueue_packet(packet_queue_t *queue, const packet_t *pkt, const struct sockaddr_in *addr)
 {
-    printf("Uso: %s <puerto>\n", program_name);
-    printf("\nEjemplo:\n");
-    printf("  %s 8081\n", program_name);
+    packet_queue_node_t *node = malloc(sizeof(packet_queue_node_t));
+    node->packet = *pkt;
+    node->from_addr = *addr;
+    node->next = NULL;
+
+    pthread_mutex_lock(&queue->mutex);
+
+    if (queue->tail)
+    {
+        queue->tail->next = node;
+    }
+    else
+    {
+        queue->head = node;
+    }
+    queue->tail = node;
+    queue->size++;
+
+    pthread_mutex_unlock(&queue->mutex);
+    pthread_cond_signal(&queue->cond); // Despertar hilo trabajador
+    sem_post(&queue_sem);              // Incrementar semáforo
 }
 
-// Función mejorada para crear nombre de archivo con sufijo "_recibido"
-void create_received_filename(const char *original_filename, char *new_filename, size_t max_size)
+// Obtener paquete de la cola (thread-safe)
+int dequeue_packet(packet_queue_t *queue, packet_t *pkt, struct sockaddr_in *addr)
 {
-    // Buscar la última aparición del punto para encontrar la extensión
+    sem_wait(&queue_sem); // Esperar hasta que haya paquetes
+
+    pthread_mutex_lock(&queue->mutex);
+
+    if (!queue->head)
+    {
+        pthread_mutex_unlock(&queue->mutex);
+        return -1;
+    }
+
+    packet_queue_node_t *node = queue->head;
+    *pkt = node->packet;
+    *addr = node->from_addr;
+
+    queue->head = node->next;
+    if (!queue->head)
+    {
+        queue->tail = NULL;
+    }
+    queue->size--;
+
+    pthread_mutex_unlock(&queue->mutex);
+    free(node);
+
+    return 0;
+}
+
+// Buscar sesión por sender_id (thread-safe)
+transfer_session_t *find_session(multi_receiver_state_t *state, uint32_t sender_id)
+{
+    pthread_mutex_lock(&state->sessions_mutex);
+
+    transfer_session_t *current = state->sessions;
+    while (current)
+    {
+        if (current->sender_id == sender_id)
+        {
+            pthread_mutex_unlock(&state->sessions_mutex);
+            return current;
+        }
+        current = current->next;
+    }
+
+    pthread_mutex_unlock(&state->sessions_mutex);
+    return NULL;
+}
+
+// Crear nueva sesión (thread-safe)
+transfer_session_t *create_session(multi_receiver_state_t *state, uint32_t sender_id,
+                                   const struct sockaddr_in *client_addr)
+{
+    transfer_session_t *session = malloc(sizeof(transfer_session_t));
+    memset(session, 0, sizeof(transfer_session_t));
+
+    session->sender_id = sender_id;
+    session->client_addr = *client_addr;
+    session->client_len = sizeof(struct sockaddr_in);
+    session->last_activity = time(NULL);
+    session->expected_seq = 1;
+    pthread_mutex_init(&session->session_mutex, NULL);
+
+    pthread_mutex_lock(&state->sessions_mutex);
+
+    // Agregar al inicio de la lista
+    session->next = state->sessions;
+    state->sessions = session;
+
+    pthread_mutex_unlock(&state->sessions_mutex);
+
+    printf("🆕 Nueva sesión creada para Sender ID: %u\n", sender_id);
+    return session;
+}
+
+// Limpiar sesión completada
+void cleanup_session(multi_receiver_state_t *state, uint32_t sender_id)
+{
+    pthread_mutex_lock(&state->sessions_mutex);
+
+    transfer_session_t *prev = NULL;
+    transfer_session_t *current = state->sessions;
+
+    while (current)
+    {
+        if (current->sender_id == sender_id)
+        {
+            if (prev)
+            {
+                prev->next = current->next;
+            }
+            else
+            {
+                state->sessions = current->next;
+            }
+
+            // Limpiar recursos de la sesión
+            if (current->file)
+            {
+                fclose(current->file);
+            }
+            if (current->received_packets)
+            {
+                free(current->received_packets);
+            }
+            pthread_mutex_destroy(&current->session_mutex);
+
+            printf("🗑️ Sesión limpiada para Sender ID: %u\n", sender_id);
+            free(current);
+            break;
+        }
+        prev = current;
+        current = current->next;
+    }
+
+    pthread_mutex_unlock(&state->sessions_mutex);
+}
+
+// Función mejorada para crear nombre de archivo único por sender
+void create_unique_filename(const char *original_filename, uint32_t sender_id,
+                            char *new_filename, size_t max_size)
+{
     const char *dot = strrchr(original_filename, '.');
     const char *slash = strrchr(original_filename, '/');
-    
-    // Asegurar que el punto encontrado es parte del nombre del archivo, no del directorio
+
     if (dot && (!slash || dot > slash))
     {
         // Hay extensión
         size_t base_len = dot - original_filename;
         char base_name[256];
-        
-        // Copiar la parte base del nombre
+
         if (base_len >= sizeof(base_name))
             base_len = sizeof(base_name) - 1;
-        
+
         strncpy(base_name, original_filename, base_len);
         base_name[base_len] = '\0';
-        
-        // Crear nuevo nombre: base_recibido.extension
-        snprintf(new_filename, max_size, "%s_recibido%s", base_name, dot);
+
+        // Crear nombre único: base_recibido_SENDERID.extension
+        snprintf(new_filename, max_size, "%s_recibido_%u%s", base_name, sender_id, dot);
     }
     else
     {
         // No hay extensión
-        snprintf(new_filename, max_size, "%s_recibido", original_filename);
+        snprintf(new_filename, max_size, "%s_recibido_%u", original_filename, sender_id);
     }
-    
-    printf("Archivo original: %s\n", original_filename);
-    printf("Archivo a crear: %s\n", new_filename);
 }
 
-int check_transfer_complete(receiver_state_t *state)
+// Manejar paquete START para multi-emisor
+int handle_multi_start(multi_receiver_state_t *state, const packet_t *pkt,
+                       const struct sockaddr_in *from_addr)
 {
-    if (!state->received_packets || state->total_packets == 0)
+    transfer_session_t *session = find_session(state, pkt->sender_id);
+
+    if (session)
     {
-        return 0;
+        printf("⚠️ Reiniciando transferencia existente para Sender ID: %u\n", pkt->sender_id);
+        cleanup_session(state, pkt->sender_id);
     }
 
-    for (uint32_t i = 1; i <= state->total_packets; i++)
+    // Crear nueva sesión
+    session = create_session(state, pkt->sender_id, from_addr);
+    if (!session)
     {
-        if (!state->received_packets[i])
+        printf("❌ Error creando sesión para Sender ID: %u\n", pkt->sender_id);
+        return -1;
+    }
+
+    pthread_mutex_lock(&session->session_mutex);
+
+    // Crear nombre de archivo único
+    char unique_filename[512];
+    create_unique_filename(pkt->filename, pkt->sender_id, unique_filename, sizeof(unique_filename));
+    strncpy(session->filename, unique_filename, MAX_FILENAME_SIZE - 1);
+
+    // Configurar sesión
+    session->total_packets = (pkt->total_packets > 0) ? pkt->total_packets : 1;
+    session->received_packets = calloc(session->total_packets + 1, sizeof(int));
+
+    if (!session->received_packets)
+    {
+        pthread_mutex_unlock(&session->session_mutex);
+        cleanup_session(state, pkt->sender_id);
+        return -1;
+    }
+
+    // Abrir archivo único
+    session->file = fopen(session->filename, "wb");
+    if (!session->file)
+    {
+        printf("❌ Error creando archivo: %s\n", session->filename);
+        pthread_mutex_unlock(&session->session_mutex);
+        cleanup_session(state, pkt->sender_id);
+        return -1;
+    }
+
+    session->last_activity = time(NULL);
+
+    printf("✅ Transferencia iniciada:\n");
+    printf("   📁 Archivo: %s\n", session->filename);
+    printf("   📦 Paquetes: %u\n", session->total_packets);
+    printf("   🆔 Sender ID: %u\n", session->sender_id);
+
+    pthread_mutex_unlock(&session->session_mutex);
+
+    // Enviar ACK
+    packet_t ack;
+    create_packet(&ack, PKT_ACK, 1, NULL, 0);
+    ack.ack_num = 1;
+    ack.sender_id = pkt->sender_id;
+    ack.checksum = calculate_checksum(&ack);
+
+    sendto(state->sockfd, &ack, sizeof(packet_t), 0,
+           (struct sockaddr *)from_addr, sizeof(struct sockaddr_in));
+    print_packet_info(&ack, "ENVIANDO ACK");
+
+    return 0;
+}
+
+// Hilo trabajador para procesar paquetes
+void *packet_worker(void *arg)
+{
+    multi_receiver_state_t *state = (multi_receiver_state_t *)arg;
+
+    while (state->running)
+    {
+        packet_t pkt;
+        struct sockaddr_in from_addr;
+
+        if (dequeue_packet(&packet_queue, &pkt, &from_addr) == 0)
         {
-            return 0;
+            printf("🔄 Procesando paquete tipo=%d, sender_id=%u, seq=%u\n",
+                   pkt.type, pkt.sender_id, pkt.seq_num);
+
+            switch (pkt.type)
+            {
+            case PKT_START:
+                handle_multi_start(state, &pkt, &from_addr);
+                break;
+
+            case PKT_DATA:
+            {
+                transfer_session_t *session = find_session(state, pkt.sender_id);
+                if (session)
+                {
+                    pthread_mutex_lock(&session->session_mutex);
+
+                    // Verificar duplicado
+                    if (!session->received_packets[pkt.seq_num])
+                    {
+                        session->received_packets[pkt.seq_num] = 1;
+
+                        // Escribir datos
+                        long file_pos = (pkt.seq_num - 1) * MAX_DATA_SIZE;
+                        fseek(session->file, file_pos, SEEK_SET);
+                        fwrite(pkt.data, 1, pkt.data_size, session->file);
+                        fflush(session->file);
+
+                        printf("📦 Paquete %u/%u recibido para %s\n",
+                               pkt.seq_num, session->total_packets, session->filename);
+                    }
+
+                    session->last_activity = time(NULL);
+
+                    // Enviar ACK
+                    packet_t ack;
+                    create_packet(&ack, PKT_ACK, pkt.seq_num, NULL, 0);
+                    ack.ack_num = pkt.seq_num;
+                    ack.sender_id = pkt.sender_id;
+                    ack.checksum = calculate_checksum(&ack);
+
+                    sendto(state->sockfd, &ack, sizeof(packet_t), 0,
+                           (struct sockaddr *)&session->client_addr,
+                           session->client_len);
+
+                    pthread_mutex_unlock(&session->session_mutex);
+                }
+                break;
+            }
+
+            case PKT_END:
+            {
+                transfer_session_t *session = find_session(state, pkt.sender_id);
+                if (session)
+                {
+                    printf("🏁 Transferencia completada para %s\n", session->filename);
+                    cleanup_session(state, pkt.sender_id);
+                }
+                break;
+            }
+            }
         }
     }
-    return 1;
-}
 
-void print_transfer_stats(receiver_state_t *state)
-{
-    if (!state->received_packets || state->total_packets == 0)
-    {
-        return;
-    }
-
-    uint32_t received_count = 0;
-    for (uint32_t i = 1; i <= state->total_packets; i++)
-    {
-        if (state->received_packets[i])
-        {
-            received_count++;
-        }
-    }
-
-    float progress = ((float)received_count / state->total_packets) * 100;
-    printf("Progreso: %.1f%% (%u/%u paquetes recibidos)\n",
-           progress, received_count, state->total_packets);
-}
-
-void cleanup_transfer(receiver_state_t *state)
-{
-    if (state->file)
-    {
-        fclose(state->file);
-        state->file = NULL;
-    }
-    if (state->received_packets)
-    {
-        free(state->received_packets);
-        state->received_packets = NULL;
-    }
-    state->total_packets = 0;
-    state->expected_seq = 1;
-    state->sender_id = 0;
-    memset(state->filename, 0, sizeof(state->filename));
+    return NULL;
 }
 
 int main(int argc, char *argv[])
 {
     if (argc != 2)
     {
-        fprintf(stderr, "Error: Se requiere exactamente 1 argumento (puerto)\n");
-        print_usage(argv[0]);
+        fprintf(stderr, "Uso: %s <puerto>\n", argv[0]);
         return 1;
     }
 
     int port = atoi(argv[1]);
 
-    if (port <= 0 || port > 65535)
+    printf("🚀 RECEPTOR MULTI-EMISOR INICIADO 🚀\n");
+    printf("Puerto: %d\n", port);
+    printf("Soporte para emisores concurrentes: ✅\n");
+    printf("====================================\n\n");
+
+    // Inicializar estado
+    memset(&global_state, 0, sizeof(global_state));
+    global_state.running = 1;
+    global_state.num_workers = 4; // 4 hilos trabajadores
+    pthread_mutex_init(&global_state.sessions_mutex, NULL);
+
+    // Crear socket
+    global_state.sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (global_state.sockfd < 0)
     {
-        fprintf(stderr, "Error: Puerto inválido %d\n", port);
+        perror("Error creando socket");
         return 1;
     }
 
-    // Configurar manejador de señales
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
 
-    printf("=== RECEPTOR INICIADO ===\n");
-    printf("Puerto: %d\n", port);
-    printf("Directorio de salida: ./\n");
-    printf("========================\n\n");
-
-    // Inicializar receptor
-    if (receiver_init(&global_state, port) < 0)
+    if (bind(global_state.sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        fprintf(stderr, "Error inicializando receptor\n");
+        perror("Error en bind");
         return 1;
+    }
+
+    // Inicializar cola de paquetes
+    init_packet_queue(&packet_queue);
+
+    // Crear hilos trabajadores
+    global_state.worker_threads = malloc(global_state.num_workers * sizeof(pthread_t));
+    for (int i = 0; i < global_state.num_workers; i++)
+    {
+        pthread_create(&global_state.worker_threads[i], NULL, packet_worker, &global_state);
     }
 
     printf("Esperando conexiones...\n\n");
 
-    int transfer_active = 0;
-    int packets_since_last_update = 0;
-
-    // Loop principal de recepción
-    while (running)
+    // Loop principal - solo recibe y encola
+    while (global_state.running)
     {
         packet_t pkt;
         struct sockaddr_in from_addr;
         socklen_t from_len = sizeof(from_addr);
 
-        int result = receive_packet(global_state.sockfd, &pkt, &from_addr, &from_len);
+        ssize_t received = recvfrom(global_state.sockfd, &pkt, sizeof(packet_t), 0,
+                                    (struct sockaddr *)&from_addr, &from_len);
 
-        if (result == 0)
+        if (received > 0 && verify_checksum(&pkt))
         {
-            print_packet_info(&pkt, "RECIBIDO");
-
-            // Guardar dirección del cliente en la primera recepción
-            if (!transfer_active || memcmp(&global_state.client_addr, &from_addr, sizeof(from_addr)) != 0)
-            {
-                global_state.client_addr = from_addr;
-                global_state.client_len = from_len;
-            }
-
-            switch (pkt.type)
-            {
-            case PKT_START:
-                printf("\n=== INICIANDO NUEVA TRANSFERENCIA ===\n");
-
-                // Si hay una transferencia activa, limpiar primero
-                if (transfer_active)
-                {
-                    printf("Limpiando transferencia anterior...\n");
-                    cleanup_transfer(&global_state);
-                }
-
-                // Crear nombre de archivo con sufijo "_recibido"
-                char received_filename[512];
-                create_received_filename(pkt.filename, received_filename, sizeof(received_filename));
-                
-                // Guardar el nombre de archivo en el estado
-                strncpy(global_state.filename, received_filename, MAX_FILENAME_SIZE - 1);
-                global_state.filename[MAX_FILENAME_SIZE - 1] = '\0';
-
-                // Actualizar el paquete para usar el nuevo nombre
-                packet_t modified_start_pkt = pkt;
-                strncpy(modified_start_pkt.filename, received_filename, MAX_FILENAME_SIZE - 1);
-                modified_start_pkt.filename[MAX_FILENAME_SIZE - 1] = '\0';
-
-                if (receiver_handle_start(&global_state, &modified_start_pkt) == 0)
-                {
-                    receiver_send_ack(&global_state, 1);
-                    transfer_active = 1;
-                    packets_since_last_update = 0;
-                    printf("Archivo de destino: %s\n", global_state.filename);
-                    printf("Total paquetes esperados: %u\n", global_state.total_packets);
-                    printf("Sender ID: %u\n", global_state.sender_id);
-                    printf("====================================\n\n");
-                }
-                else
-                {
-                    printf("Error iniciando transferencia\n");
-                    // Enviar NACK para el paquete START
-                    packet_t nack;
-                    create_packet(&nack, PKT_NACK, 0, NULL, 0);
-                    nack.ack_num = 1;
-                    nack.sender_id = pkt.sender_id;
-                    nack.checksum = calculate_checksum(&nack);
-                    send_packet(global_state.sockfd, &nack, &global_state.client_addr);
-                    print_packet_info(&nack, "ENVIANDO");
-                }
-                break;
-
-            case PKT_DATA:
-                if (transfer_active)
-                {
-                    if (receiver_handle_data(&global_state, &pkt) == 0)
-                    {
-                        packets_since_last_update++;
-
-                        // Mostrar progreso cada 10 paquetes para archivos pequeños, 50 para grandes
-                        int progress_interval = (global_state.total_packets <= 100) ? 10 : 50;
-                        if (packets_since_last_update >= progress_interval)
-                        {
-                            print_transfer_stats(&global_state);
-                            packets_since_last_update = 0;
-                        }
-
-                        // Verificar si la transferencia está completa
-                        if (check_transfer_complete(&global_state))
-                        {
-                            printf("\n=== TRANSFERENCIA COMPLETADA ===\n");
-                            printf("✓ Archivo recibido exitosamente: %s\n", global_state.filename);
-                            print_transfer_stats(&global_state);
-                            
-                            // Verificar tamaño del archivo
-                            if (global_state.file)
-                            {
-                                fflush(global_state.file);
-                                long file_size = ftell(global_state.file);
-                                printf("✓ Tamaño final del archivo: %ld bytes\n", file_size);
-                            }
-                            
-                            printf("===============================\n\n");
-
-                            // Limpiar para próxima transferencia
-                            cleanup_transfer(&global_state);
-                            transfer_active = 0;
-
-                            printf("Esperando nueva transferencia...\n");
-                        }
-                    }
-                }
-                else
-                {
-                    printf("Paquete DATA recibido sin transferencia activa, ignorando\n");
-                }
-                break;
-
-            case PKT_END:
-                printf("\n=== PAQUETE END RECIBIDO ===\n");
-                if (transfer_active)
-                {
-                    if (check_transfer_complete(&global_state))
-                    {
-                        printf("✓ Transferencia finalizada correctamente\n");
-                        printf("✓ Archivo completo: %s\n", global_state.filename);
-                        print_transfer_stats(&global_state);
-                        
-                        if (global_state.file)
-                        {
-                            fflush(global_state.file);
-                            long file_size = ftell(global_state.file);
-                            printf("✓ Tamaño final: %ld bytes\n", file_size);
-                        }
-                    }
-                    else
-                    {
-                        printf("⚠ ADVERTENCIA: Transferencia incompleta\n");
-                        print_transfer_stats(&global_state);
-
-                        // Solicitar retransmisión de paquetes faltantes
-                        printf("Solicitando retransmisión de paquetes faltantes:\n");
-                        int missing_count = 0;
-                        for (uint32_t i = 1; i <= global_state.total_packets; i++)
-                        {
-                            if (!global_state.received_packets[i])
-                            {
-                                if (missing_count < 10) // Limitar salida para archivos grandes
-                                {
-                                    printf("- Falta paquete %u\n", i);
-                                }
-                                receiver_send_nack(&global_state, i);
-                                missing_count++;
-                            }
-                        }
-                        if (missing_count > 10)
-                        {
-                            printf("- ... y %d paquetes más\n", missing_count - 10);
-                        }
-                    }
-
-                    // Limpiar transferencia independientemente del resultado
-                    cleanup_transfer(&global_state);
-                    transfer_active = 0;
-                    printf("Esperando nueva transferencia...\n");
-                }
-                else
-                {
-                    printf("Paquete END recibido sin transferencia activa\n");
-                }
-                break;
-
-            default:
-                printf("⚠ Tipo de paquete desconocido: %d\n", pkt.type);
-                break;
-            }
-        }
-        else if (result == -2)
-        {
-            printf("⚠ Paquete con checksum inválido ignorado\n");
-        }
-        else if (result == -1)
-        {
-            // Error de recepción normal (timeout), no imprimir mensaje
+            enqueue_packet(&packet_queue, &pkt, &from_addr);
         }
 
-        // Pequeña pausa para evitar saturar la CPU
-        usleep(1000);
+        usleep(1000); // Pausa mínima
     }
-
-    printf("\nCerrando receptor...\n");
-    receiver_cleanup(&global_state);
 
     return 0;
 }

@@ -109,4 +109,45 @@ int receiver_send_ack(receiver_state_t *state, uint32_t seq_num);
 int receiver_send_nack(receiver_state_t *state, uint32_t seq_num);
 void receiver_cleanup(receiver_state_t *state);
 
+
+// Estructura para manejar múltiples transferencias
+typedef struct transfer_session {
+    uint32_t sender_id;
+    char filename[MAX_FILENAME_SIZE];
+    FILE *file;
+    uint32_t total_packets;
+    uint32_t expected_seq;
+    int *received_packets;
+    struct sockaddr_in client_addr;
+    socklen_t client_len;
+    time_t last_activity;
+    pthread_mutex_t session_mutex;
+    struct transfer_session *next;
+} transfer_session_t;
+
+// Estado del receptor multi-sesión
+typedef struct {
+    int sockfd;
+    transfer_session_t *sessions;  // Lista enlazada de sesiones activas
+    pthread_mutex_t sessions_mutex;  // Mutex para la lista de sesiones
+    pthread_t *worker_threads;     // Array de hilos trabajadores
+    int num_workers;
+    volatile int running;
+} multi_receiver_state_t;
+
+// Cola de paquetes para procesamiento
+typedef struct packet_queue_node {
+    packet_t packet;
+    struct sockaddr_in from_addr;
+    struct packet_queue_node *next;
+} packet_queue_node_t;
+
+typedef struct {
+    packet_queue_node_t *head;
+    packet_queue_node_t *tail;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int size;
+} packet_queue_t;
+
 #endif // PROTOCOLO_H
