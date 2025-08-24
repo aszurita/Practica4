@@ -223,42 +223,57 @@ int sender_start_transmission(sender_state_t *state)
     return -1;
 }
 
-// Enviar ventana de paquetes
+// Función corregida para enviar ventana
 int sender_send_window(sender_state_t *state)
 {
     pthread_mutex_lock(&state->mutex);
 
+    // Enviar hasta llenar la ventana
     while (state->next_seq < state->base_seq + WINDOW_SIZE &&
            state->next_seq <= state->total_packets)
     {
-
         int window_index = (state->next_seq - 1) % WINDOW_SIZE;
         window_slot_t *slot = &state->window[window_index];
 
+        // Solo enviar si no está ya enviado
         if (!slot->sent)
         {
-            // Leer datos del archivo
+            // Calcular posición en el archivo
+            long file_pos = (state->next_seq - 1) * MAX_DATA_SIZE;
+            fseek(state->file, file_pos, SEEK_SET);
+
             char buffer[MAX_DATA_SIZE];
             size_t bytes_read = fread(buffer, 1, MAX_DATA_SIZE, state->file);
 
-            if (bytes_read > 0)
+            if (bytes_read >= 0) // Permitir paquetes vacíos para archivos pequeños
             {
                 create_packet(&slot->packet, PKT_DATA, state->next_seq, buffer, bytes_read);
-                slot->packet.sender_id = state->sender_id;                 // Set sender ID
-                slot->packet.checksum = calculate_checksum(&slot->packet); // Recalculate checksum
-                send_packet(state->sockfd, &slot->packet, &state->dest_addr);
+                slot->packet.sender_id = state->sender_id;
+                slot->packet.checksum = calculate_checksum(&slot->packet);
 
-                slot->sent = 1;
-                gettimeofday(&slot->sent_time, NULL);
-
-                print_packet_info(&slot->packet, "ENVIANDO");
-                state->next_seq++;
+                if (send_packet(state->sockfd, &slot->packet, &state->dest_addr) == 0)
+                {
+                    slot->sent = 1;
+                    gettimeofday(&slot->sent_time, NULL);
+                    print_packet_info(&slot->packet, "ENVIANDO");
+                    state->next_seq++;
+                }
+                else
+                {
+                    printf("Error enviando paquete %u\n", state->next_seq);
+                    break;
+                }
             }
-            else if (feof(state->file))
+            else
             {
-                // End of file reached
+                printf("Error leyendo archivo en posición %ld\n", file_pos);
                 break;
             }
+        }
+        else
+        {
+            // El slot ya está ocupado, salir del bucle
+            break;
         }
     }
 
@@ -271,26 +286,33 @@ int sender_handle_ack(sender_state_t *state, const packet_t *ack)
 {
     pthread_mutex_lock(&state->mutex);
 
-    if (ack->type == PKT_ACK && ack->ack_num >= state->base_seq)
+    if (ack->type == PKT_ACK && ack->ack_num >= state->base_seq && ack->ack_num <= state->total_packets)
     {
-        // Mover ventana
-        uint32_t old_base = state->base_seq;
-        state->base_seq = ack->ack_num + 1;
+        printf("ACK recibido para paquete: %u (base actual: %u)\n", ack->ack_num, state->base_seq);
 
-        // Limpiar slots acknowledgados
-        for (uint32_t seq = old_base; seq <= ack->ack_num; seq++)
+        // Marcar todos los paquetes hasta ack_num como confirmados
+        for (uint32_t seq = state->base_seq; seq <= ack->ack_num; seq++)
         {
             int window_index = (seq - 1) % WINDOW_SIZE;
             state->window[window_index].sent = 0;
         }
 
-        printf("ACK recibido: %u, nueva base: %u\n", ack->ack_num, state->base_seq);
+        // Actualizar base de la ventana
+        if (ack->ack_num >= state->base_seq)
+        {
+            state->base_seq = ack->ack_num + 1;
+            printf("Nueva base de ventana: %u\n", state->base_seq);
+        }
+    }
+    else
+    {
+        printf("ACK fuera de rango o inválido: seq=%u, ack=%u, base=%u\n",
+               ack->seq_num, ack->ack_num, state->base_seq);
     }
 
     pthread_mutex_unlock(&state->mutex);
     return 0;
 }
-
 // Manejar NACK recibido
 int sender_handle_nack(sender_state_t *state, const packet_t *nack)
 {
@@ -444,21 +466,28 @@ int receiver_handle_start(receiver_state_t *state, const packet_t *pkt)
     return 0;
 }
 
-// Manejar paquete de datos
+// En receptor.c, modificar receiver_handle_data para enviar ACK individual
 int receiver_handle_data(receiver_state_t *state, const packet_t *pkt)
 {
     pthread_mutex_lock(&state->mutex);
 
-    // Verify sender ID matches
+    // Verificar sender ID
     if (pkt->sender_id != state->sender_id)
     {
-        printf("Paquete de sender ID diferente (%u != %u), ignorando\n",
-               pkt->sender_id, state->sender_id);
+        printf("Sender ID no coincide (%u != %u)\n", pkt->sender_id, state->sender_id);
         pthread_mutex_unlock(&state->mutex);
         return -1;
     }
 
-    // Verificar si es un paquete duplicado
+    // Verificar rango válido
+    if (pkt->seq_num == 0 || pkt->seq_num > state->total_packets)
+    {
+        printf("Número de secuencia inválido: %u\n", pkt->seq_num);
+        pthread_mutex_unlock(&state->mutex);
+        return -1;
+    }
+
+    // Verificar duplicado
     if (state->received_packets[pkt->seq_num])
     {
         printf("Paquete duplicado: %u\n", pkt->seq_num);
@@ -470,15 +499,16 @@ int receiver_handle_data(receiver_state_t *state, const packet_t *pkt)
     // Marcar como recibido
     state->received_packets[pkt->seq_num] = 1;
 
-    // Escribir datos en la posición correcta
-    fseek(state->file, (pkt->seq_num - 1) * MAX_DATA_SIZE, SEEK_SET);
+    // Escribir datos
+    long file_pos = (pkt->seq_num - 1) * MAX_DATA_SIZE;
+    fseek(state->file, file_pos, SEEK_SET);
     fwrite(pkt->data, 1, pkt->data_size, state->file);
     fflush(state->file);
 
-    printf("Paquete %u/%u recibido y escrito (Sender ID: %u)\n",
-           pkt->seq_num, state->total_packets, pkt->sender_id);
+    printf("Paquete %u/%u recibido (%zu bytes)\n",
+           pkt->seq_num, state->total_packets, pkt->data_size);
 
-    // Enviar ACK
+    // Enviar ACK individual (no acumulativo)
     receiver_send_ack(state, pkt->seq_num);
 
     pthread_mutex_unlock(&state->mutex);

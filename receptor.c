@@ -16,7 +16,41 @@ void print_usage(const char *program_name)
 {
     printf("Uso: %s <puerto>\n", program_name);
     printf("\nEjemplo:\n");
-    printf("  %s 8080\n", program_name);
+    printf("  %s 8081\n", program_name);
+}
+
+// Función mejorada para crear nombre de archivo con sufijo "_recibido"
+void create_received_filename(const char *original_filename, char *new_filename, size_t max_size)
+{
+    // Buscar la última aparición del punto para encontrar la extensión
+    const char *dot = strrchr(original_filename, '.');
+    const char *slash = strrchr(original_filename, '/');
+    
+    // Asegurar que el punto encontrado es parte del nombre del archivo, no del directorio
+    if (dot && (!slash || dot > slash))
+    {
+        // Hay extensión
+        size_t base_len = dot - original_filename;
+        char base_name[256];
+        
+        // Copiar la parte base del nombre
+        if (base_len >= sizeof(base_name))
+            base_len = sizeof(base_name) - 1;
+        
+        strncpy(base_name, original_filename, base_len);
+        base_name[base_len] = '\0';
+        
+        // Crear nuevo nombre: base_recibido.extension
+        snprintf(new_filename, max_size, "%s_recibido%s", base_name, dot);
+    }
+    else
+    {
+        // No hay extensión
+        snprintf(new_filename, max_size, "%s_recibido", original_filename);
+    }
+    
+    printf("Archivo original: %s\n", original_filename);
+    printf("Archivo a crear: %s\n", new_filename);
 }
 
 int check_transfer_complete(receiver_state_t *state)
@@ -57,10 +91,26 @@ void print_transfer_stats(receiver_state_t *state)
            progress, received_count, state->total_packets);
 }
 
+void cleanup_transfer(receiver_state_t *state)
+{
+    if (state->file)
+    {
+        fclose(state->file);
+        state->file = NULL;
+    }
+    if (state->received_packets)
+    {
+        free(state->received_packets);
+        state->received_packets = NULL;
+    }
+    state->total_packets = 0;
+    state->expected_seq = 1;
+    state->sender_id = 0;
+    memset(state->filename, 0, sizeof(state->filename));
+}
+
 int main(int argc, char *argv[])
 {
-    char output_dir[256] = "./";
-
     if (argc != 2)
     {
         fprintf(stderr, "Error: Se requiere exactamente 1 argumento (puerto)\n");
@@ -76,20 +126,13 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Verificar que el directorio existe
-    if (access(output_dir, W_OK) != 0)
-    {
-        fprintf(stderr, "Error: No se puede escribir en el directorio %s\n", output_dir);
-        return 1;
-    }
-
     // Configurar manejador de señales
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     printf("=== RECEPTOR INICIADO ===\n");
     printf("Puerto: %d\n", port);
-    printf("Directorio de salida: %s\n", output_dir);
+    printf("Directorio de salida: ./\n");
     printf("========================\n\n");
 
     // Inicializar receptor
@@ -117,8 +160,8 @@ int main(int argc, char *argv[])
         {
             print_packet_info(&pkt, "RECIBIDO");
 
-            // Guardar dirección del cliente
-            if (!transfer_active)
+            // Guardar dirección del cliente en la primera recepción
+            if (!transfer_active || memcmp(&global_state.client_addr, &from_addr, sizeof(from_addr)) != 0)
             {
                 global_state.client_addr = from_addr;
                 global_state.client_len = from_len;
@@ -129,147 +172,166 @@ int main(int argc, char *argv[])
             case PKT_START:
                 printf("\n=== INICIANDO NUEVA TRANSFERENCIA ===\n");
 
-                // Crear nuevo nombre de archivo con "_recibido" preservando extensión
-                char original_filename[256];
-                char new_filename[256];
-                strncpy(original_filename, pkt.filename, sizeof(original_filename) - 1);
-                original_filename[sizeof(original_filename) - 1] = '\0';
-
-                // Preservar extensión original
-                char *dot = strrchr(original_filename, '.');
-                if (dot != NULL)
+                // Si hay una transferencia activa, limpiar primero
+                if (transfer_active)
                 {
-                    // Insertar "_recibido" antes de la extensión
-                    char temp[256];
-                    strncpy(temp, dot, sizeof(temp) - 1);
-                    temp[sizeof(temp) - 1] = '\0';
-                    *dot = '\0';
-                    snprintf(new_filename, sizeof(new_filename), "%s_recibido%s", original_filename, temp);
-                }
-                else
-                {
-                    // No hay extensión, solo agregar "_recibido"
-                    snprintf(new_filename, sizeof(new_filename), "%s_recibido", original_filename);
+                    printf("Limpiando transferencia anterior...\n");
+                    cleanup_transfer(&global_state);
                 }
 
-                // Preparar nombre de archivo completo con directorio
-                char full_path[512];
-                snprintf(full_path, sizeof(full_path), "%s%s", output_dir, new_filename);
-                strncpy(global_state.filename, full_path, MAX_FILENAME_SIZE - 1);
+                // Crear nombre de archivo con sufijo "_recibido"
+                char received_filename[512];
+                create_received_filename(pkt.filename, received_filename, sizeof(received_filename));
+                
+                // Guardar el nombre de archivo en el estado
+                strncpy(global_state.filename, received_filename, MAX_FILENAME_SIZE - 1);
+                global_state.filename[MAX_FILENAME_SIZE - 1] = '\0';
 
-                if (receiver_handle_start(&global_state, &pkt) == 0)
+                // Actualizar el paquete para usar el nuevo nombre
+                packet_t modified_start_pkt = pkt;
+                strncpy(modified_start_pkt.filename, received_filename, MAX_FILENAME_SIZE - 1);
+                modified_start_pkt.filename[MAX_FILENAME_SIZE - 1] = '\0';
+
+                if (receiver_handle_start(&global_state, &modified_start_pkt) == 0)
                 {
-                    receiver_send_ack(&global_state, 1);  // ACK for START packet with seq=1
+                    receiver_send_ack(&global_state, 1);
                     transfer_active = 1;
                     packets_since_last_update = 0;
-                    printf("Archivo: %s\n", global_state.filename);
+                    printf("Archivo de destino: %s\n", global_state.filename);
                     printf("Total paquetes esperados: %u\n", global_state.total_packets);
+                    printf("Sender ID: %u\n", global_state.sender_id);
                     printf("====================================\n\n");
                 }
                 else
                 {
-                    receiver_send_nack(&global_state, 1);  // NACK for START packet with seq=1
+                    printf("Error iniciando transferencia\n");
+                    // Enviar NACK para el paquete START
+                    packet_t nack;
+                    create_packet(&nack, PKT_NACK, 0, NULL, 0);
+                    nack.ack_num = 1;
+                    nack.sender_id = pkt.sender_id;
+                    nack.checksum = calculate_checksum(&nack);
+                    send_packet(global_state.sockfd, &nack, &global_state.client_addr);
+                    print_packet_info(&nack, "ENVIANDO");
                 }
                 break;
 
             case PKT_DATA:
                 if (transfer_active)
                 {
-                    receiver_handle_data(&global_state, &pkt);
-                    packets_since_last_update++;
-
-                    // Mostrar progreso cada 50 paquetes
-                    if (packets_since_last_update >= 50)
+                    if (receiver_handle_data(&global_state, &pkt) == 0)
                     {
-                        print_transfer_stats(&global_state);
-                        packets_since_last_update = 0;
-                    }
+                        packets_since_last_update++;
 
-                    // Verificar si la transferencia está completa
-                    if (check_transfer_complete(&global_state))
-                    {
-                        printf("\n=== TRANSFERENCIA COMPLETADA ===\n");
-                        printf("Archivo recibido exitosamente: %s\n", global_state.filename);
-                        print_transfer_stats(&global_state);
-                        printf("===============================\n\n");
-
-                        // Limpiar para próxima transferencia
-                        if (global_state.file)
+                        // Mostrar progreso cada 10 paquetes para archivos pequeños, 50 para grandes
+                        int progress_interval = (global_state.total_packets <= 100) ? 10 : 50;
+                        if (packets_since_last_update >= progress_interval)
                         {
-                            fclose(global_state.file);
-                            global_state.file = NULL;
+                            print_transfer_stats(&global_state);
+                            packets_since_last_update = 0;
                         }
-                        if (global_state.received_packets)
-                        {
-                            free(global_state.received_packets);
-                            global_state.received_packets = NULL;
-                        }
-                        transfer_active = 0;
-                        global_state.total_packets = 0;
-                        global_state.expected_seq = 1;
 
-                        printf("Esperando nueva transferencia...\n");
+                        // Verificar si la transferencia está completa
+                        if (check_transfer_complete(&global_state))
+                        {
+                            printf("\n=== TRANSFERENCIA COMPLETADA ===\n");
+                            printf("✓ Archivo recibido exitosamente: %s\n", global_state.filename);
+                            print_transfer_stats(&global_state);
+                            
+                            // Verificar tamaño del archivo
+                            if (global_state.file)
+                            {
+                                fflush(global_state.file);
+                                long file_size = ftell(global_state.file);
+                                printf("✓ Tamaño final del archivo: %ld bytes\n", file_size);
+                            }
+                            
+                            printf("===============================\n\n");
+
+                            // Limpiar para próxima transferencia
+                            cleanup_transfer(&global_state);
+                            transfer_active = 0;
+
+                            printf("Esperando nueva transferencia...\n");
+                        }
                     }
+                }
+                else
+                {
+                    printf("Paquete DATA recibido sin transferencia activa, ignorando\n");
                 }
                 break;
 
             case PKT_END:
-                printf("\nPaquete END recibido\n");
+                printf("\n=== PAQUETE END RECIBIDO ===\n");
                 if (transfer_active)
                 {
                     if (check_transfer_complete(&global_state))
                     {
-                        printf("Transferencia finalizada correctamente\n");
-                        printf("Archivo recibido exitosamente: %s\n", global_state.filename);
+                        printf("✓ Transferencia finalizada correctamente\n");
+                        printf("✓ Archivo completo: %s\n", global_state.filename);
                         print_transfer_stats(&global_state);
                         
-                        // Limpiar para próxima transferencia
                         if (global_state.file)
                         {
-                            fclose(global_state.file);
-                            global_state.file = NULL;
+                            fflush(global_state.file);
+                            long file_size = ftell(global_state.file);
+                            printf("✓ Tamaño final: %ld bytes\n", file_size);
                         }
-                        if (global_state.received_packets)
-                        {
-                            free(global_state.received_packets);
-                            global_state.received_packets = NULL;
-                        }
-                        transfer_active = 0;
-                        global_state.total_packets = 0;
-                        global_state.expected_seq = 1;
-
-                        printf("Esperando nueva transferencia...\n");
                     }
                     else
                     {
-                        printf("ADVERTENCIA: Transferencia incompleta\n");
+                        printf("⚠ ADVERTENCIA: Transferencia incompleta\n");
                         print_transfer_stats(&global_state);
 
                         // Solicitar retransmisión de paquetes faltantes
-                        printf("Solicitando retransmisión de paquetes faltantes...\n");
+                        printf("Solicitando retransmisión de paquetes faltantes:\n");
+                        int missing_count = 0;
                         for (uint32_t i = 1; i <= global_state.total_packets; i++)
                         {
                             if (!global_state.received_packets[i])
                             {
-                                printf("Solicitando paquete %u\n", i);
+                                if (missing_count < 10) // Limitar salida para archivos grandes
+                                {
+                                    printf("- Falta paquete %u\n", i);
+                                }
                                 receiver_send_nack(&global_state, i);
+                                missing_count++;
                             }
                         }
+                        if (missing_count > 10)
+                        {
+                            printf("- ... y %d paquetes más\n", missing_count - 10);
+                        }
                     }
+
+                    // Limpiar transferencia independientemente del resultado
+                    cleanup_transfer(&global_state);
+                    transfer_active = 0;
+                    printf("Esperando nueva transferencia...\n");
+                }
+                else
+                {
+                    printf("Paquete END recibido sin transferencia activa\n");
                 }
                 break;
 
             default:
-                printf("Tipo de paquete desconocido: %d\n", pkt.type);
+                printf("⚠ Tipo de paquete desconocido: %d\n", pkt.type);
                 break;
             }
         }
         else if (result == -2)
         {
-            printf("Paquete con checksum inválido ignorado\n");
+            printf("⚠ Paquete con checksum inválido ignorado\n");
+        }
+        else if (result == -1)
+        {
+            // Error de recepción normal (timeout), no imprimir mensaje
         }
 
-        usleep(1000); // Pequeña pausa para evitar saturar la CPU
+        // Pequeña pausa para evitar saturar la CPU
+        usleep(1000);
     }
 
     printf("\nCerrando receptor...\n");

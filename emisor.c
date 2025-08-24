@@ -16,35 +16,61 @@ void *timeout_handler(void *arg)
 {
     sender_state_t *state = (sender_state_t *)arg;
 
-    while (running && state->base_seq <= state->total_packets)
+    // En emisor.c, loop principal mejorado
+    while (running && global_state.base_seq <= global_state.total_packets)
     {
-        usleep(TIMEOUT_SEC * 1000000); // Esperar timeout
+        // Enviar ventana de paquetes
+        sender_send_window(&global_state);
 
-        pthread_mutex_lock(&state->mutex);
-        struct timeval now;
-        gettimeofday(&now, NULL);
+        // Recibir y procesar ACKs con timeout más corto
+        packet_t ack;
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
 
-        // Verificar timeouts y retransmitir
-        for (int i = 0; i < WINDOW_SIZE; i++)
+        // Usar timeout más corto para ACKs
+        struct timeval old_timeout, new_timeout;
+        socklen_t optlen = sizeof(old_timeout);
+        getsockopt(global_state.sockfd, SOL_SOCKET, SO_RCVTIMEO, &old_timeout, &optlen);
+
+        new_timeout.tv_sec = 0;
+        new_timeout.tv_usec = 50000; // 50ms
+        setsockopt(global_state.sockfd, SOL_SOCKET, SO_RCVTIMEO, &new_timeout, sizeof(new_timeout));
+
+        int result = receive_packet(global_state.sockfd, &ack, &from_addr, &from_len);
+
+        // Restaurar timeout original
+        setsockopt(global_state.sockfd, SOL_SOCKET, SO_RCVTIMEO, &old_timeout, sizeof(old_timeout));
+
+        if (result == 0)
         {
-            window_slot_t *slot = &state->window[i];
-            if (slot->sent)
+            print_packet_info(&ack, "RECIBIDO");
+
+            switch (ack.type)
             {
-                double elapsed = (now.tv_sec - slot->sent_time.tv_sec) +
-                                 (now.tv_usec - slot->sent_time.tv_usec) / 1000000.0;
-
-                if (elapsed > TIMEOUT_SEC)
-                {
-                    printf("Timeout para paquete %u, retransmitiendo\n",
-                           slot->packet.seq_num);
-
-                    send_packet(state->sockfd, &slot->packet, &state->dest_addr);
-                    gettimeofday(&slot->sent_time, NULL);
-                    print_packet_info(&slot->packet, "RETRANSMITIENDO");
-                }
+            case PKT_ACK:
+                sender_handle_ack(&global_state, &ack);
+                break;
+            case PKT_NACK:
+                sender_handle_nack(&global_state, &ack);
+                break;
+            default:
+                printf("Paquete inesperado: tipo=%d\n", ack.type);
+                break;
             }
         }
-        pthread_mutex_unlock(&state->mutex);
+
+        // Mostrar progreso más frecuentemente
+        static uint32_t last_progress = 0;
+        if (global_state.base_seq != last_progress)
+        {
+            float progress = ((float)(global_state.base_seq - 1) / global_state.total_packets) * 100;
+            printf("Progreso: %.1f%% (%u/%u paquetes confirmados)\n",
+                   progress, global_state.base_seq - 1, global_state.total_packets);
+            last_progress = global_state.base_seq;
+        }
+
+        // Pausa muy pequeña
+        usleep(1000); // 1ms
     }
 
     return NULL;
@@ -131,18 +157,19 @@ int main(int argc, char *argv[])
         if (result == 0)
         {
             print_packet_info(&ack, "RECIBIDO");
-            
+
             // Handle different packet types
-            switch (ack.type) {
-                case PKT_ACK:
-                    sender_handle_ack(&global_state, &ack);
-                    break;
-                case PKT_NACK:
-                    sender_handle_nack(&global_state, &ack);
-                    break;
-                default:
-                    printf("Paquete inesperado recibido: tipo=%d\n", ack.type);
-                    break;
+            switch (ack.type)
+            {
+            case PKT_ACK:
+                sender_handle_ack(&global_state, &ack);
+                break;
+            case PKT_NACK:
+                sender_handle_nack(&global_state, &ack);
+                break;
+            default:
+                printf("Paquete inesperado recibido: tipo=%d\n", ack.type);
+                break;
             }
         }
 
@@ -155,7 +182,7 @@ int main(int argc, char *argv[])
         }
 
         // Check if we've sent all packets and are waiting for final ACKs
-        if (global_state.next_seq > global_state.total_packets && 
+        if (global_state.next_seq > global_state.total_packets &&
             global_state.base_seq <= global_state.total_packets)
         {
             usleep(10000); // Wait a bit for ACKs to arrive
